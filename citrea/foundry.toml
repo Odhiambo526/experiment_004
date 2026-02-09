@@ -1,0 +1,13 @@
+[profile.default]
+src = "src"
+out = "out"
+libs = ["Lib"]
+solc_version = "0.8.26"
+optimizer = true
+optimizer_runs = 200
+via_ir = true
+remappings = [
+    "bitcoin-spv/=Lib/bitcoin-spv/",
+    "openzeppelin-contracts-upgradeable/=Lib/openzeppelin-contracts-upgradeable/",
+    "../lib/=Lib/",
+]

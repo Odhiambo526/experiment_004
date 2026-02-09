@@ -1,0 +1,291 @@
+// Token Identity Verification - Prisma Schema
+// This schema defines the data model for a token verification/attestation system
+// that helps UIs disambiguate tokens sharing the same ticker symbol.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// =============================================================================
+// PROJECTS
+// A project represents a token issuer/team that can have multiple tokens
+// =============================================================================
+model Project {
+  id           String   @id @default(cuid())
+  displayName  String   @map("display_name")
+  description  String?
+  contactEmail String?  @map("contact_email")
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  tokens  Token[]
+  apiKeys ApiKey[]
+
+  @@map("projects")
+}
+
+// =============================================================================
+// API KEYS
+// Authentication keys for project access (Milestone 2)
+// =============================================================================
+model ApiKey {
+  id         String    @id @default(cuid())
+  projectId  String    @map("project_id")
+  name       String    // e.g., "Production Key", "Dev Key"
+  keyHash    String    @map("key_hash") // argon2 hash of the key
+  keyPrefix  String    @map("key_prefix") // first 8 chars for identification (e.g., "tvk_abc1")
+  createdAt  DateTime  @default(now()) @map("created_at")
+  lastUsedAt DateTime? @map("last_used_at")
+  expiresAt  DateTime? @map("expires_at")
+  revokedAt  DateTime? @map("revoked_at")
+
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@index([keyHash])
+  @@index([projectId])
+  @@map("api_keys")
+}
+
+// =============================================================================
+// TOKENS
+// Each token is uniquely identified by (chain_id, contract_address)
+// Multiple tokens CAN share the same symbol - this is the collision we solve
+// =============================================================================
+model Token {
+  id              String   @id @default(cuid())
+  projectId       String   @map("project_id")
+  chainId         Int      @map("chain_id")
+  contractAddress String   @map("contract_address")
+  symbol          String
+  name            String
+  decimals        Int?
+  logoUrl         String?  @map("logo_url")
+  websiteUrl      String?  @map("website_url")
+  createdAt       DateTime @default(now()) @map("created_at")
+  updatedAt       DateTime @updatedAt @map("updated_at")
+
+  // Re-verification status fields (Milestone 2)
+  lastReverifiedAt   DateTime? @map("last_reverified_at")
+  reverifyFailCount  Int       @default(0) @map("reverify_fail_count")
+  reverifyStatus     String    @default("ok") @map("reverify_status") // ok, failing, grace, revoked
+  reverifyGraceUntil DateTime? @map("reverify_grace_until")
+
+  project              Project               @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  verificationRequests VerificationRequest[]
+  attestations         Attestation[]
+
+  // Unique constraint: only one token per (chain, address) pair
+  @@unique([chainId, contractAddress])
+  // Index for symbol lookups (collision queries)
+  @@index([symbol])
+  @@map("tokens")
+}
+
+// =============================================================================
+// VERIFICATION REQUESTS
+// Tracks the verification workflow state for a token
+// =============================================================================
+enum VerificationStatus {
+  PENDING      // Initial state, awaiting proofs
+  NEEDS_ACTION // Some proofs failed, applicant needs to fix
+  IN_REVIEW    // All automated checks passed, awaiting human review
+  APPROVED     // Verified successfully
+  REJECTED     // Verification denied
+  REVOKED      // Previously approved but now revoked
+}
+
+model VerificationRequest {
+  id            String             @id @default(cuid())
+  tokenId       String             @map("token_id")
+  status        VerificationStatus @default(PENDING)
+  nonce         String             @unique // Used in proof challenges
+  reviewerNotes String?            @map("reviewer_notes")
+  reviewedAt    DateTime?          @map("reviewed_at")
+  reviewedBy    String?            @map("reviewed_by")
+  createdAt     DateTime           @default(now()) @map("created_at")
+  updatedAt     DateTime           @updatedAt @map("updated_at")
+
+  token  Token   @relation(fields: [tokenId], references: [id], onDelete: Cascade)
+  proofs Proof[]
+
+  @@index([status])
+  @@map("verification_requests")
+}
+
+// =============================================================================
+// PROOFS
+// Individual proof items for a verification request
+// =============================================================================
+enum ProofType {
+  ONCHAIN_SIGNATURE // EIP-191 signature from owner/deployer
+  DNS_TXT           // DNS TXT record proof
+  GITHUB_REPO       // GitHub repository file proof
+  GITHUB_ORG        // GitHub organization proof
+  TWITTER           // X/Twitter proof (future work - requires official API)
+  OTHER             // Reserved for future proof types
+}
+
+enum ProofStatus {
+  PENDING // Not yet checked
+  VALID   // Proof verified successfully
+  INVALID // Proof verification failed
+  EXPIRED // Proof was valid but has expired/been removed
+}
+
+model Proof {
+  id                    String   @id @default(cuid())
+  verificationRequestId String   @map("verification_request_id")
+  type                  ProofType
+  status                ProofStatus @default(PENDING)
+  
+  // Payload contains type-specific data:
+  // - ONCHAIN_SIGNATURE: { message, signature, recoveredAddress, expectedAddress, verificationTier }
+  // - DNS_TXT: { domain, expectedRecord, foundRecords }
+  // - GITHUB_REPO: { repoUrl, filePath, expectedContent, foundContent }
+  payload               Json
+  
+  checkedAt             DateTime? @map("checked_at")
+  failureReason         String?   @map("failure_reason")
+  createdAt             DateTime  @default(now()) @map("created_at")
+  updatedAt             DateTime  @updatedAt @map("updated_at")
+
+  verificationRequest VerificationRequest @relation(fields: [verificationRequestId], references: [id], onDelete: Cascade)
+
+  @@index([verificationRequestId])
+  @@index([type, status])
+  @@map("proofs")
+}
+
+// =============================================================================
+// ATTESTATIONS
+// Signed attestations issued for verified tokens
+// These are the artifacts integrators (wallets/DEXes) consume
+// =============================================================================
+model Attestation {
+  id            String    @id @default(cuid())
+  tokenId       String    @map("token_id")
+  version       Int       @default(1)
+  
+  // The attestation bundle - contains token metadata + verification tier
+  attestationJson Json    @map("attestation_json")
+  
+  // Cryptographic signature of attestationJson
+  signature     String
+  publicKeyId   String    @map("public_key_id")
+  
+  issuedAt      DateTime  @default(now()) @map("issued_at")
+  revokedAt     DateTime? @map("revoked_at")
+  revokedReason String?   @map("revoked_reason")
+
+  token Token @relation(fields: [tokenId], references: [id], onDelete: Cascade)
+
+  @@index([tokenId])
+  @@index([issuedAt])
+  @@map("attestations")
+}
+
+// =============================================================================
+// AUDIT LOG
+// Immutable log of all system actions for transparency and debugging
+// =============================================================================
+enum AuditActor {
+  SYSTEM    // Automated system actions
+  APPLICANT // Token project actions
+  REVIEWER  // Admin/reviewer actions
+}
+
+model AuditLog {
+  id         String     @id @default(cuid())
+  actor      AuditActor
+  actorId    String?    @map("actor_id") // User ID if applicable
+  action     String     // e.g., "verification.submitted", "proof.checked", "attestation.issued"
+  targetType String     @map("target_type") // e.g., "token", "verification_request", "proof"
+  targetId   String     @map("target_id")
+  metadata   Json       @default("{}")
+  ipAddress  String?    @map("ip_address")
+  userAgent  String?    @map("user_agent")
+  createdAt  DateTime   @default(now()) @map("created_at")
+
+  @@index([targetType, targetId])
+  @@index([action])
+  @@index([createdAt])
+  @@map("audit_logs")
+}
+
+// =============================================================================
+// SIGNING KEYS
+// Server signing keys for attestations (supports key rotation)
+// =============================================================================
+model SigningKey {
+  id          String   @id @default(cuid())
+  algorithm   String   // e.g., "Ed25519", "ES256K"
+  publicKey   String   @map("public_key") // Base64 encoded
+  privateKey  String   @map("private_key") // Encrypted, base64 encoded
+  isActive    Boolean  @default(true) @map("is_active")
+  createdAt   DateTime @default(now()) @map("created_at")
+  retiredAt   DateTime? @map("retired_at")
+
+  @@index([isActive])
+  @@map("signing_keys")
+}
+
+// =============================================================================
+// DISPUTES / APPEALS
+// Mechanism for disputing verification decisions
+// =============================================================================
+enum DisputeStatus {
+  OPEN
+  UNDER_REVIEW
+  RESOLVED_UPHELD    // Original decision stands
+  RESOLVED_OVERTURNED // Decision reversed
+  CLOSED
+}
+
+model Dispute {
+  id                    String        @id @default(cuid())
+  verificationRequestId String        @map("verification_request_id")
+  status                DisputeStatus @default(OPEN)
+  reason                String        // Why the applicant is disputing
+  evidence              Json          @default("[]") // Array of evidence items
+  resolution            String?       // Final resolution explanation
+  resolvedAt            DateTime?     @map("resolved_at")
+  resolvedBy            String?       @map("resolved_by")
+  createdAt             DateTime      @default(now()) @map("created_at")
+  updatedAt             DateTime      @updatedAt @map("updated_at")
+
+  @@index([status])
+  @@map("disputes")
+}
+
+// =============================================================================
+// RE-VERIFICATION JOBS
+// Track periodic re-verification of approved tokens
+// =============================================================================
+enum ReverificationStatus {
+  SCHEDULED
+  IN_PROGRESS
+  PASSED
+  FAILED
+  GRACE_PERIOD // Failed but within grace period before downgrade
+}
+
+model ReverificationJob {
+  id          String               @id @default(cuid())
+  tokenId     String               @map("token_id")
+  status      ReverificationStatus @default(SCHEDULED)
+  scheduledAt DateTime             @map("scheduled_at")
+  startedAt   DateTime?            @map("started_at")
+  completedAt DateTime?            @map("completed_at")
+  results     Json                 @default("{}") // Detailed check results
+  failCount   Int                  @default(0) @map("fail_count") // Consecutive failures
+  createdAt   DateTime             @default(now()) @map("created_at")
+
+  @@index([status])
+  @@index([scheduledAt])
+  @@map("reverification_jobs")
+}

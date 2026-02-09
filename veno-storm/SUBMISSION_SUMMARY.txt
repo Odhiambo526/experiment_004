@@ -1,0 +1,85 @@
+================================================================================
+BUG BOUNTY SUBMISSION: depositFromFountain Credits Wrong User
+================================================================================
+
+ISSUE: depositFromFountain() credits deposits to Fountain contract instead of end-users
+
+SEVERITY: Critical
+
+IMPACT: Users lose all rewards when depositing through Fountain
+
+================================================================================
+PROOF OF CONCEPT
+================================================================================
+
+Location: /home/odhiambo/veno-storm/test/DepositFromFountainIssue.t.sol
+
+Test Results (All 4 tests PASS, proving the issue):
+
+✓ testDepositFromFountainCreditsWrongUser (gas: 230426)
+  - Fountain deposits 1000e18 on behalf of Alice
+  - Alice's balance: 0 (should be 1000e18)
+  - Fountain's balance: 1000e18 (should be 0)
+  - Alice's rewards: 0 (should be > 0)
+  - Fountain's rewards: 79200e18 (should be 0)
+
+✓ testDirectDepositCreditsCorrectUser (gas: 204744)
+  - Alice deposits 1000e18 directly
+  - Alice's balance: 1000e18 ✓
+  - Alice's rewards: > 0 ✓
+
+✓ testCompareFountainVsDirectDeposit (gas: 333114)
+  - Fountain deposits 1000e18, Bob deposits 1000e18
+  - Alice rewards: 0 (Fountain's intended beneficiary)
+  - Bob rewards: > 0 ✓
+  - Fountain rewards: > 0 (should go to Alice)
+
+✓ testMultipleUsersDepositFromFountain (gas: 361592)
+  - Fountain makes 2 deposits (for Alice and Bob)
+  - Alice balance: 0, rewards: 0
+  - Bob balance: 0, rewards: 0
+  - Fountain balance: 2000e18, rewards: > 0
+
+================================================================================
+RUNNING THE TESTS
+================================================================================
+
+cd /home/odhiambo/veno-storm
+forge test --match-path test/DepositFromFountainIssue.t.sol -vv
+
+All tests pass, confirming the vulnerability exists.
+
+================================================================================
+ROOT CAUSE
+================================================================================
+
+_deposit() always uses msg.sender:
+  - userInfo[_pid][msg.sender] ← credits Fountain, not user
+  - safeTransferFrom(msg.sender, ...) ← pulls from Fountain
+  - _safeVnoTransfer(msg.sender, ...) ← sends rewards to Fountain
+  - _updatePidBoostedAmount(_pid, msg.sender) ← updates Fountain's boost
+
+When depositFromFountain() calls _deposit():
+  - msg.sender = Fountain contract
+  - All accounting goes to Fountain address
+  - End-users never receive credit
+
+================================================================================
+RECOMMENDED FIX
+================================================================================
+
+Add user parameter to depositFromFountain():
+
+function depositFromFountain(
+    uint256 _pid, 
+    uint256 _amount, 
+    address _user,
+    IVenoVault _vault
+) external {
+    require(msg.sender == address(fountain));
+    _depositFor(_pid, _amount, _user, msg.sender, _vault);
+}
+
+Create _depositFor() that separates token source from credit recipient.
+
+================================================================================
